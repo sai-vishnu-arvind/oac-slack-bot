@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+
+# Environment
+.env
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Knowledge base data
+.oac-bot/
