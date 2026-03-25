@@ -52,11 +52,12 @@ pub async fn execute_plugin_via_cli(
         cmd.arg("--resume").arg(sid);
     }
 
-    // The user query
-    cmd.arg("-p").arg(query);
+    // Pass query via stdin to avoid shell escaping issues
+    // (enriched queries contain ---, DevRev content, URLs, etc.)
+    cmd.arg("--print");
 
-    // Capture output
-    cmd.stdout(Stdio::piped())
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     tracing::info!(
@@ -66,9 +67,18 @@ pub async fn execute_plugin_via_cli(
         "Spawning claude CLI for plugin"
     );
 
-    let child = cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         format!("Failed to spawn claude CLI: {}. Is claude installed and in PATH?", e)
     })?;
+
+    // Write query to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(query.as_bytes()).await.map_err(|e| {
+            format!("Failed to write query to claude CLI stdin: {}", e)
+        })?;
+        drop(stdin); // Close stdin to signal EOF
+    }
 
     let output = child.wait_with_output().await.map_err(|e| {
         format!("Claude CLI process failed: {}", e)
@@ -165,10 +175,9 @@ where
         cmd.arg("--resume").arg(sid);
     }
 
-    // The user query
-    cmd.arg("-p").arg(query);
-
-    cmd.stdout(Stdio::piped())
+    // Pass query via stdin (avoid shell escaping issues with enriched content)
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     tracing::info!(
@@ -181,6 +190,15 @@ where
     let mut child = cmd.spawn().map_err(|e| {
         format!("Failed to spawn claude CLI: {}. Is claude installed and in PATH?", e)
     })?;
+
+    // Write query to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(query.as_bytes()).await.map_err(|e| {
+            format!("Failed to write query to claude CLI stdin: {}", e)
+        })?;
+        drop(stdin); // Close stdin to signal EOF
+    }
 
     let stdout = child.stdout.take()
         .ok_or("Failed to capture claude CLI stdout")?;
