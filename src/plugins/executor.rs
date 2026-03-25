@@ -30,11 +30,12 @@ pub async fn execute_plugin_via_cli(
 ) -> Result<CliResult, String> {
     let mut cmd = Command::new("claude");
 
-    // Core flags
+    // Core flags — use stream-json to capture actual response text
     cmd.arg("--print")
         .arg("--dangerously-skip-permissions")
-        .arg("--output-format").arg("json")
-        .arg("--bare");
+        .arg("--output-format").arg("stream-json")
+        .arg("--verbose")
+;
 
     // System prompt = the plugin's SKILL.md content
     cmd.arg("--system-prompt").arg(&plugin.system_prompt);
@@ -84,8 +85,10 @@ pub async fn execute_plugin_via_cli(
         format!("Claude CLI process failed: {}", e)
     })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() && stdout.is_empty() {
         tracing::error!(
             fqn = %plugin.fqn,
             exit_code = ?output.status.code(),
@@ -96,30 +99,53 @@ pub async fn execute_plugin_via_cli(
             output.status.code().unwrap_or(-1), stderr));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse stream-json output — each line is a JSON object
+    // Collect text from "assistant" messages and metadata from "result" message
+    let mut text = String::new();
+    let mut cli_session_id: Option<String> = None;
+    let mut cost: f64 = 0.0;
+    let mut duration_ms: u64 = 0;
 
-    // Parse JSON output — claude --print --output-format json returns a single JSON object
-    let result: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
-        tracing::error!(raw_output = %stdout, "Failed to parse CLI JSON output");
-        format!("Failed to parse claude CLI output: {}", e)
-    })?;
+    for line in stdout.lines() {
+        if line.is_empty() { continue; }
+        let parsed: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-    let text = result.get("result")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    let cli_session_id = result.get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let cost = result.get("total_cost_usd")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let duration_ms = result.get("duration_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+        match msg_type {
+            "assistant" => {
+                // Extract text from assistant message content blocks
+                if let Some(content) = parsed.pointer("/message/content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                        }
+                    }
+                }
+            }
+            "result" => {
+                // Capture metadata from the final result line
+                if let Some(r) = parsed.get("result").and_then(|v| v.as_str()) {
+                    if !r.is_empty() && text.is_empty() {
+                        text = r.to_string();
+                    }
+                }
+                cli_session_id = parsed.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                cost = parsed.get("total_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                duration_ms = parsed.get("duration_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
 
     tracing::info!(
         fqn = %plugin.fqn,
@@ -157,7 +183,7 @@ where
         .arg("--dangerously-skip-permissions")
         .arg("--output-format").arg("stream-json")
         .arg("--verbose")
-        .arg("--bare");
+;
 
     // System prompt = the plugin's SKILL.md content
     cmd.arg("--system-prompt").arg(&plugin.system_prompt);

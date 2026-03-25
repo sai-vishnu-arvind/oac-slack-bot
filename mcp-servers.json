@@ -7,20 +7,21 @@
         "https://api.coralogix.in/mgmt/api/v1/mcp",
         "--header",
         "Authorization:cxup_fjnGzJyzaKDxN0apXyXw5c7zVm395j"
-      ],
-      "env": {
-        "CORALOGIX_API_KEY": "cxup_fjnGzJyzaKDxN0apXyXw5c7zVm395j"
-      }
+      ]
     },
     "trino-streamable": {
-      "type": "streamable-http",
-      "url": "https://mcp-trino.de.razorpay.com/mcp/"
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://mcp-trino.de.razorpay.com/mcp/"
+      ]
     },
     "splitz-mcp": {
-      "name": "splitz_mcp",
-      "url": "https://splitz-concierge.razorpay.com/mcp",
-      "transport": "streamable-http",
-      "streamable": true
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://splitz-concierge.razorpay.com/mcp"
+      ]
     }
   }
 }
