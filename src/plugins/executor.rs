@@ -1,448 +1,312 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::Stdio;
 
-use futures_util::future::join_all;
-use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
-use crate::claude::client::ClaudeClient;
-use crate::claude::types::{ContentBlock, Message, MessageContent, Role, Tool, ToolCall};
-use crate::plugins::registry::{GetError, Plugin, PluginRegistry};
+use crate::plugins::registry::Plugin;
 
-const MAX_DEPTH: u32 = 2;
-
-// ── Tool definitions ──────────────────────────────────────────────────────────
-
-pub fn invoke_plugin_tool() -> Tool {
-    Tool {
-        name: "invoke_plugin".into(),
-        description: "Invoke a named plugin to handle a specialized task. \
-                      Use when a subtask requires domain expertise from another plugin. \
-                      Plugins can chain into other plugins."
-            .into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "plugin_name": {
-                    "type": "string",
-                    "description": "Fully-qualified plugin name like 'second-brain:capture' \
-                                   or 'backend-engineer:brainstorming'. Use bare name only \
-                                   for ungrouped plugins like 'oncall-debugger'. \
-                                   Use list_plugins or list_plugin_commands to discover names."
-                },
-                "query": {
-                    "type": "string",
-                    "description": "The question or task to pass to the plugin"
-                }
-            },
-            "required": ["plugin_name", "query"]
-        }),
-    }
+/// Result from a CLI execution: the response text and optional session ID for resume.
+pub struct CliResult {
+    pub text: String,
+    pub session_id: Option<String>,
 }
 
-pub fn list_plugins_tool() -> Tool {
-    Tool {
-        name: "list_plugins".into(),
-        description: "List all available plugins with their fully-qualified names, \
-                      descriptions, and groups. Use when unsure which plugin handles a task."
-            .into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        }),
-    }
-}
+// ── CLI-based executor ───────────────────────────────────────────────────────
 
-pub fn list_plugin_commands_tool() -> Tool {
-    Tool {
-        name: "list_plugin_commands".into(),
-        description: "List all sub-commands of a specific plugin group. \
-                      Use when you know the group (e.g. 'second-brain') but need to \
-                      discover which commands are available within it."
-            .into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "group": {
-                    "type": "string",
-                    "description": "The plugin group name (e.g. 'second-brain', 'agent-ready', 'backend-engineer')"
-                }
-            },
-            "required": ["group"]
-        }),
-    }
-}
-
-pub fn spawn_agents_tool() -> Tool {
-    Tool {
-        name: "spawn_agents".into(),
-        description: "Spawn multiple plugins in parallel and wait for all results. \
-                      Use this instead of sequential invoke_plugin calls when you need \
-                      data from several sources simultaneously (e.g. logs + metrics + \
-                      deployments + architecture all at once). \
-                      Returns a JSON object mapping each plugin_name to its result."
-            .into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "agents": {
-                    "type": "array",
-                    "description": "List of plugins to run in parallel",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "plugin_name": {
-                                "type": "string",
-                                "description": "Fully-qualified plugin name (e.g. 'second-brain:capture')"
-                            },
-                            "query": {
-                                "type": "string",
-                                "description": "The question or task for this plugin"
-                            }
-                        },
-                        "required": ["plugin_name", "query"]
-                    },
-                    "minItems": 2
-                }
-            },
-            "required": ["agents"]
-        }),
-    }
-}
-
-// ── Executor ──────────────────────────────────────────────────────────────────
-
-/// Execute a plugin with the given query and conversation history.
-/// Returns the plugin's final text response.
+/// Execute a plugin by spawning the `claude` CLI as a subprocess.
 ///
-/// `depth` prevents infinite recursion — starts at 0, max is MAX_DEPTH (3).
-pub fn execute_plugin<'a>(
-    plugin: &'a Plugin,
-    query: &'a str,
-    history: &'a [Message],
-    client: &'a ClaudeClient,
-    registry: &'a PluginRegistry,
-    depth: u32,
-) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-    Box::pin(async move {
-        // 1. Build messages: history + user query
-        let mut messages: Vec<Message> = history.to_vec();
-        messages.push(Message::user(query));
+/// The CLI has full access to: Bash, Read, Grep, Glob, Agent, MCP servers
+/// (Coralogix, Trino, Splitz, etc.), and all native Claude Code tools.
+///
+/// This replaces the old Vertex AI API call + 4 custom tools approach.
+pub async fn execute_plugin_via_cli(
+    plugin: &Plugin,
+    query: &str,
+    session_id: Option<&str>,
+    mcp_config_path: Option<&str>,
+) -> Result<CliResult, String> {
+    let mut cmd = Command::new("claude");
 
-        // 2. Build system prompt with runtime context about available tools
-        let system_prompt = format!(
-            "{}\n\n\
-            ---\n\
-            # RUNTIME CONTEXT (from bot runtime — takes priority over instructions above)\n\n\
-            You are running inside a Slack bot, NOT inside Claude Code CLI.\n\
-            You do NOT have access to: Bash, Read, Glob, Grep, file system, MCP servers \
-            (Coralogix, Watchtower, Trino, Kubernetes, Google Drive, Slack MCP, GitHub MCP).\n\n\
-            You ONLY have these 4 tools: invoke_plugin, list_plugins, list_plugin_commands, spawn_agents.\n\
-            These tools call other SKILL.md-based plugins — NOT MCP servers.\n\n\
-            If the user's message already contains fetched data (DevRev ticket details, Slack thread \
-            content), analyze that data directly. Do NOT try to fetch it again.\n\n\
-            Focus on providing the best analysis you can with the information already in the message. \
-            Use invoke_plugin/spawn_agents ONLY if another SKILL.md plugin would genuinely add value \
-            (use list_plugins first to see what's available). If no plugin helps, just analyze directly.\n\
-            ---",
-            plugin.system_prompt
+    // Core flags
+    cmd.arg("--print")
+        .arg("--dangerously-skip-permissions")
+        .arg("--output-format").arg("json")
+        .arg("--bare");
+
+    // System prompt = the plugin's SKILL.md content
+    cmd.arg("--system-prompt").arg(&plugin.system_prompt);
+
+    // MCP server configuration
+    if let Some(mcp_path) = mcp_config_path {
+        let path = PathBuf::from(mcp_path);
+        if path.exists() {
+            cmd.arg("--mcp-config").arg(mcp_path);
+        }
+    }
+
+    // Resume existing session for multi-turn conversations
+    if let Some(sid) = session_id {
+        cmd.arg("--resume").arg(sid);
+    }
+
+    // The user query
+    cmd.arg("-p").arg(query);
+
+    // Capture output
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    tracing::info!(
+        fqn = %plugin.fqn,
+        query_len = query.len(),
+        has_session = session_id.is_some(),
+        "Spawning claude CLI for plugin"
+    );
+
+    let child = cmd.spawn().map_err(|e| {
+        format!("Failed to spawn claude CLI: {}. Is claude installed and in PATH?", e)
+    })?;
+
+    let output = child.wait_with_output().await.map_err(|e| {
+        format!("Claude CLI process failed: {}", e)
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            fqn = %plugin.fqn,
+            exit_code = ?output.status.code(),
+            stderr = %stderr,
+            "Claude CLI exited with error"
         );
+        return Err(format!("Claude CLI error (exit {}): {}",
+            output.status.code().unwrap_or(-1), stderr));
+    }
 
-        // 3. For top-level plugin (depth 0), skip tools entirely.
-        //    The enriched message already has DevRev/Slack data — just analyze it.
-        //    Sub-plugins (depth > 0) get tools for chaining.
-        if depth == 0 {
-            let (text, _) = client
-                .complete(messages, Some(&system_prompt), None)
-                .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-            tracing::info!(
-                fqn = %plugin.fqn,
-                text_len = text.len(),
-                "Top-level plugin response (no tools)"
-            );
+    // Parse JSON output — claude --print --output-format json returns a single JSON object
+    let result: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        tracing::error!(raw_output = %stdout, "Failed to parse CLI JSON output");
+        format!("Failed to parse claude CLI output: {}", e)
+    })?;
 
-            return Ok(text);
-        }
+    let text = result.get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-        // 4. Sub-plugin: define tools and run multi-turn loop
-        let tools = vec![
-            invoke_plugin_tool(),
-            list_plugins_tool(),
-            list_plugin_commands_tool(),
-            spawn_agents_tool(),
-        ];
-        let sub_max_rounds: usize = 2;
-        let mut last_text = String::new();
+    let cli_session_id = result.get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-        for round in 0..sub_max_rounds {
-            let round_tools = if round == sub_max_rounds - 1 {
-                None
-            } else {
-                Some(tools.clone())
-            };
+    let cost = result.get("total_cost_usd")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
-            let (text, tool_calls) = client
-                .complete(
-                    messages.clone(),
-                    Some(&system_prompt),
-                    round_tools,
-                )
-                .await?;
+    let duration_ms = result.get("duration_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
-            tracing::info!(
-                fqn = %plugin.fqn,
-                round = round,
-                text_len = text.len(),
-                tool_call_count = tool_calls.len(),
-                tool_names = ?tool_calls.iter().map(|tc| tc.name.as_str()).collect::<Vec<_>>(),
-                "Claude call result"
-            );
+    tracing::info!(
+        fqn = %plugin.fqn,
+        text_len = text.len(),
+        session_id = ?cli_session_id,
+        cost_usd = cost,
+        duration_ms = duration_ms,
+        "Claude CLI execution complete"
+    );
 
-            if !text.is_empty() {
-                last_text = text.clone();
-            }
-
-            // No tool calls — we're done. Return this round's text,
-            // or fall back to the best text from earlier rounds.
-            if tool_calls.is_empty() {
-                if text.is_empty() {
-                    return Ok(last_text);
-                }
-                return Ok(text);
-            }
-
-            // Dispatch each tool call
-            let mut results: Vec<(String, String)> = Vec::new();
-            for tc in &tool_calls {
-                tracing::debug!(tool = %tc.name, input = %tc.input, "Dispatching tool call");
-                let tool_result = dispatch_tool_call(tc, client, registry, depth).await;
-                tracing::debug!(tool = %tc.name, result_len = tool_result.len(), "Tool call result");
-                results.push((tc.id.clone(), tool_result));
-            }
-
-            // Append assistant message with tool-use blocks + any text
-            let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-            if !text.is_empty() {
-                assistant_blocks.push(ContentBlock::Text { text });
-            }
-            for tc in &tool_calls {
-                assistant_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.input.clone(),
-                });
-            }
-            messages.push(Message {
-                role: Role::Assistant,
-                content: MessageContent::Blocks(assistant_blocks),
-            });
-
-            // Append user message with tool results
-            let result_blocks: Vec<ContentBlock> = results
-                .iter()
-                .map(|(id, content)| ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: content.clone(),
-                })
-                .collect();
-            messages.push(Message {
-                role: Role::User,
-                content: MessageContent::Blocks(result_blocks),
-            });
-        }
-
-        // Hit the round limit — return whatever text we have
-        tracing::warn!(fqn = %plugin.fqn, "Hit max tool rounds ({})", sub_max_rounds);
-        Ok(last_text)
+    Ok(CliResult {
+        text,
+        session_id: cli_session_id,
     })
 }
 
-// ── Tool dispatch helper ──────────────────────────────────────────────────────
+/// Execute a plugin by spawning the `claude` CLI with streaming JSON output.
+///
+/// Streams text chunks as they arrive, calling `on_text` for each chunk.
+/// Returns the final result text and session ID.
+pub async fn execute_plugin_via_cli_streaming<F>(
+    plugin: &Plugin,
+    query: &str,
+    session_id: Option<&str>,
+    mcp_config_path: Option<&str>,
+    mut on_text: F,
+) -> Result<CliResult, String>
+where
+    F: FnMut(&str) + Send,
+{
+    let mut cmd = Command::new("claude");
 
-/// Resolve a single tool call to a result string.
-async fn dispatch_tool_call(
-    tc: &ToolCall,
-    client: &ClaudeClient,
-    registry: &PluginRegistry,
-    depth: u32,
-) -> String {
-    match tc.name.as_str() {
-        "invoke_plugin" => {
-            let plugin_name = match tc.input.get("plugin_name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => return "invoke_plugin: missing 'plugin_name' field".to_string(),
-            };
-            let sub_query = match tc.input.get("query").and_then(|v| v.as_str()) {
-                Some(q) => q,
-                None => return "invoke_plugin: missing 'query' field".to_string(),
-            };
+    // Core flags — use stream-json for streaming
+    cmd.arg("--print")
+        .arg("--dangerously-skip-permissions")
+        .arg("--output-format").arg("stream-json")
+        .arg("--verbose")
+        .arg("--bare");
 
-            if depth >= MAX_DEPTH {
-                return "[Plugin depth limit reached]".to_string();
-            }
+    // System prompt = the plugin's SKILL.md content
+    cmd.arg("--system-prompt").arg(&plugin.system_prompt);
 
-            match registry.get_or_ambiguous(plugin_name) {
-                Ok(sub_plugin) => {
-                    match execute_plugin(sub_plugin, sub_query, &[], client, registry, depth + 1)
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => format!("Plugin '{}' error: {}", plugin_name, e),
+    // MCP server configuration
+    if let Some(mcp_path) = mcp_config_path {
+        let path = PathBuf::from(mcp_path);
+        if path.exists() {
+            cmd.arg("--mcp-config").arg(mcp_path);
+        }
+    }
+
+    // Resume existing session
+    if let Some(sid) = session_id {
+        cmd.arg("--resume").arg(sid);
+    }
+
+    // The user query
+    cmd.arg("-p").arg(query);
+
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    tracing::info!(
+        fqn = %plugin.fqn,
+        query_len = query.len(),
+        has_session = session_id.is_some(),
+        "Spawning claude CLI (streaming) for plugin"
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        format!("Failed to spawn claude CLI: {}. Is claude installed and in PATH?", e)
+    })?;
+
+    let stdout = child.stdout.take()
+        .ok_or("Failed to capture claude CLI stdout")?;
+
+    let mut reader = BufReader::new(stdout).lines();
+    let mut full_text = String::new();
+    let mut cli_session_id: Option<String> = None;
+
+    // Read streaming JSON lines
+    while let Some(line) = reader.next_line().await.map_err(|e| {
+        format!("Error reading claude CLI output: {}", e)
+    })? {
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse each JSON line
+        let parsed: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue, // Skip unparseable lines
+        };
+
+        let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match msg_type {
+            "assistant" => {
+                // Extract text from assistant message content blocks
+                if let Some(message) = parsed.get("message") {
+                    if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+                        for block in content {
+                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                full_text.push_str(text);
+                                on_text(text);
+                            }
+                        }
                     }
                 }
-                Err(GetError::NotFound) => {
-                    let available: Vec<String> =
-                        registry.list().into_iter().map(|(fqn, _, _)| fqn).collect();
-                    format!(
-                        "Plugin '{}' not found. Available: {:?}",
-                        plugin_name, available
-                    )
-                }
-                Err(GetError::Ambiguous(fqns)) => {
-                    format!(
-                        "Ambiguous plugin name '{}'. Use a fully-qualified name: {}",
-                        plugin_name,
-                        fqns.join(", ")
-                    )
-                }
             }
-        }
+            "result" => {
+                // Final result — capture session ID and result text
+                if let Some(result_text) = parsed.get("result").and_then(|v| v.as_str()) {
+                    if !result_text.is_empty() {
+                        full_text = result_text.to_string();
+                    }
+                }
+                cli_session_id = parsed.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
-        "list_plugins" => {
-            let entries: Vec<serde_json::Value> = registry
-                .list()
-                .into_iter()
-                .map(|(fqn, description, group)| {
-                    json!({
-                        "fqn": fqn,
-                        "description": description,
-                        "group": group
-                    })
-                })
-                .collect();
-            serde_json::to_string(&entries)
-                .unwrap_or_else(|_| "[]".to_string())
-        }
+                let cost = parsed.get("total_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
 
-        "list_plugin_commands" => {
-            let group = match tc.input.get("group").and_then(|v| v.as_str()) {
-                Some(g) => g,
-                None => return "list_plugin_commands: missing 'group' field".to_string(),
-            };
-
-            let commands = registry.get_group_commands(group);
-            if commands.is_empty() {
-                let groups = registry.groups();
-                return format!(
-                    "No commands found for group '{}'. Available groups: {:?}",
-                    group, groups
+                tracing::info!(
+                    fqn = %plugin.fqn,
+                    text_len = full_text.len(),
+                    session_id = ?cli_session_id,
+                    cost_usd = cost,
+                    "Claude CLI streaming complete"
                 );
             }
-
-            let entries: Vec<serde_json::Value> = commands
-                .into_iter()
-                .map(|p| {
-                    json!({
-                        "fqn": p.fqn,
-                        "name": p.name,
-                        "description": p.description
-                    })
-                })
-                .collect();
-            serde_json::to_string_pretty(&entries)
-                .unwrap_or_else(|_| "[]".to_string())
-        }
-
-        "spawn_agents" => {
-            spawn_agents_parallel(tc, client, registry, depth).await
-        }
-
-        unknown => format!("Unknown tool: {}", unknown),
-    }
-}
-
-// ── Parallel agent spawning ───────────────────────────────────────────────────
-
-/// Execute multiple plugins concurrently and return all results as a JSON object.
-async fn spawn_agents_parallel(
-    tc: &ToolCall,
-    client: &ClaudeClient,
-    registry: &PluginRegistry,
-    depth: u32,
-) -> String {
-    if depth >= MAX_DEPTH {
-        return "[Agent depth limit reached — cannot spawn further sub-agents]".to_string();
-    }
-
-    let agents_val = match tc.input.get("agents").and_then(|v| v.as_array()) {
-        Some(a) => a.clone(),
-        None => return "spawn_agents: missing or invalid 'agents' array".to_string(),
-    };
-
-    let mut tasks: Vec<(String, String, &Plugin)> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-
-    for agent in &agents_val {
-        let plugin_name = match agent.get("plugin_name").and_then(|v| v.as_str()) {
-            Some(n) => n.to_string(),
-            None => {
-                errors.push("spawn_agents: agent missing 'plugin_name'".to_string());
-                continue;
+            "system" => {
+                // Capture session ID from init message
+                let subtype = parsed.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                if subtype == "init" {
+                    cli_session_id = parsed.get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
             }
-        };
-        let query = match agent.get("query").and_then(|v| v.as_str()) {
-            Some(q) => q.to_string(),
-            None => {
-                errors.push(format!("spawn_agents: agent '{}' missing 'query'", plugin_name));
-                continue;
-            }
-        };
-        match registry.get_or_ambiguous(&plugin_name) {
-            Ok(plugin) => tasks.push((plugin_name, query, plugin)),
-            Err(GetError::NotFound) => {
-                errors.push(format!("spawn_agents: plugin '{}' not found", plugin_name))
-            }
-            Err(GetError::Ambiguous(fqns)) => {
-                errors.push(format!(
-                    "spawn_agents: '{}' is ambiguous, use FQN: {}",
-                    plugin_name,
-                    fqns.join(", ")
-                ))
+            _ => {
+                // Ignore other message types (tool_use, system hooks, etc.)
             }
         }
     }
 
-    // Run all valid plugins concurrently
-    let futures = tasks.iter().map(|(name, query, plugin)| {
-        let name = name.clone();
-        async move {
-            let result = execute_plugin(plugin, query, &[], client, registry, depth + 1).await;
-            (name, result)
-        }
-    });
+    // Wait for the process to finish
+    let status = child.wait().await.map_err(|e| {
+        format!("Failed to wait for claude CLI: {}", e)
+    })?;
 
-    let results = join_all(futures).await;
-
-    let mut map = serde_json::Map::new();
-
-    for err in errors {
-        map.insert(
-            format!("_error_{}", map.len()),
-            serde_json::Value::String(err),
+    if !status.success() {
+        tracing::warn!(
+            fqn = %plugin.fqn,
+            exit_code = ?status.code(),
+            "Claude CLI exited with non-zero status (may still have output)"
         );
     }
 
-    for (name, result) in results {
-        let value = match result {
-            Ok(text) => serde_json::Value::String(text),
-            Err(e) => serde_json::Value::String(format!("[error: {}]", e)),
-        };
-        map.insert(name, value);
-    }
+    Ok(CliResult {
+        text: full_text,
+        session_id: cli_session_id,
+    })
+}
 
-    serde_json::to_string_pretty(&serde_json::Value::Object(map))
-        .unwrap_or_else(|_| "{}".to_string())
+// ── Backward-compatible wrapper ──────────────────────────────────────────────
+
+/// Execute a plugin — backward-compatible wrapper that matches the old signature.
+///
+/// This is called from events.rs. It delegates to `execute_plugin_via_cli`.
+/// The `client` and `registry` params are kept for API compatibility but unused.
+pub fn execute_plugin<'a>(
+    plugin: &'a Plugin,
+    query: &'a str,
+    _history: &'a [crate::claude::types::Message],
+    _client: &'a crate::claude::client::ClaudeClient,
+    _registry: &'a crate::plugins::registry::PluginRegistry,
+    _depth: u32,
+) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Resolve MCP config path relative to the executable
+        let mcp_config = std::env::current_dir()
+            .ok()
+            .map(|d| d.join("mcp-servers.json"))
+            .and_then(|p| if p.exists() { Some(p.to_string_lossy().to_string()) } else { None });
+
+        let result = execute_plugin_via_cli(
+            plugin,
+            query,
+            None, // No session resume in the backward-compatible path
+            mcp_config.as_deref(),
+        )
+        .await?;
+
+        Ok(result.text)
+    })
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -452,60 +316,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_invoke_plugin_tool_schema() {
-        let tool = invoke_plugin_tool();
-        assert_eq!(tool.name, "invoke_plugin");
-        assert!(tool.input_schema["properties"]["plugin_name"].is_object());
-        assert!(tool.input_schema["properties"]["query"].is_object());
-        // Schema mentions FQN
-        let plugin_name_desc = tool.input_schema["properties"]["plugin_name"]["description"]
-            .as_str()
-            .unwrap();
-        assert!(plugin_name_desc.contains("Fully-qualified"));
+    fn test_cli_result_struct() {
+        let result = CliResult {
+            text: "Hello".to_string(),
+            session_id: Some("abc-123".to_string()),
+        };
+        assert_eq!(result.text, "Hello");
+        assert_eq!(result.session_id.unwrap(), "abc-123");
     }
 
     #[test]
-    fn test_list_plugins_tool_schema() {
-        let tool = list_plugins_tool();
-        assert_eq!(tool.name, "list_plugins");
-        assert!(tool.description.contains("fully-qualified"));
-    }
-
-    #[test]
-    fn test_list_plugin_commands_tool_schema() {
-        let tool = list_plugin_commands_tool();
-        assert_eq!(tool.name, "list_plugin_commands");
-        assert!(tool.input_schema["properties"]["group"].is_object());
-        assert!(tool.description.contains("sub-commands"));
-    }
-
-    #[test]
-    fn test_depth_limit_message() {
-        assert_eq!(MAX_DEPTH, 3);
-    }
-
-    #[test]
-    fn test_spawn_agents_tool_schema() {
-        let tool = spawn_agents_tool();
-        assert_eq!(tool.name, "spawn_agents");
-        let agents = &tool.input_schema["properties"]["agents"];
-        assert!(agents.is_object());
-        assert_eq!(agents["type"], "array");
-        assert_eq!(agents["minItems"], 2);
-    }
-
-    #[test]
-    fn test_all_four_tools_distinct_names() {
-        let names: Vec<_> = [
-            invoke_plugin_tool(),
-            list_plugins_tool(),
-            list_plugin_commands_tool(),
-            spawn_agents_tool(),
-        ]
-        .iter()
-        .map(|t| t.name.clone())
-        .collect();
-        let unique: std::collections::HashSet<_> = names.iter().collect();
-        assert_eq!(names.len(), unique.len(), "all tool names must be unique");
+    fn test_cli_result_no_session() {
+        let result = CliResult {
+            text: "Response".to_string(),
+            session_id: None,
+        };
+        assert!(result.session_id.is_none());
     }
 }
