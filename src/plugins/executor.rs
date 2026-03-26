@@ -35,7 +35,7 @@ pub async fn execute_plugin_via_cli(
         .arg("--dangerously-skip-permissions")
         .arg("--output-format").arg("stream-json")
         .arg("--verbose")
-;
+        .arg("--model").arg("sonnet");
 
     // System prompt = the plugin's SKILL.md content
     cmd.arg("--system-prompt").arg(&plugin.system_prompt);
@@ -183,7 +183,7 @@ where
         .arg("--dangerously-skip-permissions")
         .arg("--output-format").arg("stream-json")
         .arg("--verbose")
-;
+        .arg("--model").arg("sonnet");
 
     // System prompt = the plugin's SKILL.md content
     cmd.arg("--system-prompt").arg(&plugin.system_prompt);
