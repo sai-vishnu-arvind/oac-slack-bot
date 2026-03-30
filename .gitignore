@@ -1,5 +1,16 @@
-# Build artifacts
+# Rust build artifacts
 /target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Environment
 .env
